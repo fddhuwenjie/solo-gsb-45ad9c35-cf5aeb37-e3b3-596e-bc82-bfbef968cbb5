@@ -1,28 +1,45 @@
 """FastAPI application exposing the AIS decoding and vessel snapshot endpoints."""
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import threading
+import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 from . import __version__
 from .assembler import assemble
 from .models import (
+    Candidate,
     DecodeRequest,
     DecodeResponse,
     DecodeResult,
     IngestRequest,
     IngestResponse,
+    MessageData,
+    ReviewBatch,
+    ReviewBatchSummary,
+    ReviewCreateRequest,
+    ReviewResolveRequest,
+    ReviewStatus,
     SentenceIn,
     Summary,
     VesselSnapshot,
 )
 from .nmea import Fragment, SentenceError, parse_sentence
-from .storage import KIND_POSITION, KIND_STATIC, SnapshotStore, normalize_observed_at
+from .storage import (
+    KIND_POSITION,
+    KIND_STATIC,
+    SnapshotStore,
+    _parse_observed_at,
+    normalize_observed_at,
+)
 
 # Default location of the snapshot database; docker-compose points
 # AIS_DB_PATH at a named volume so snapshots survive restarts.
@@ -39,7 +56,10 @@ app = FastAPI(
         "ambiguity) and decodes AIS message types 1/2/3 and 5. POST /ingest "
         "additionally maintains persistent per-(source_id, MMSI) snapshots "
         "of the latest position and static/voyage messages, queryable via "
-        "GET /vessels."
+        "GET /vessels. Ambiguous batches can be stored via POST /reviews "
+        "for manual review; a human picks one listed candidate per ambiguous "
+        "pool and POST /reviews/{batch_id}/resolve applies the selection "
+        "to the snapshots atomically."
     ),
 )
 
@@ -91,17 +111,21 @@ def process_batch(items: list[SentenceIn]) -> list[DecodeResult]:
     return results
 
 
-def _build_response(items: list[SentenceIn]) -> DecodeResponse:
-    results = process_batch(items)
-    summary = Summary(
-        total_sentences=len(items),
+def summarize(results: list[DecodeResult], total_sentences: int) -> Summary:
+    """Aggregate per-result statuses into the batch summary."""
+    return Summary(
+        total_sentences=total_sentences,
         invalid_sentences=sum(1 for r in results if r.status == "error" and r.error != "decode_error"),
         decoded=sum(1 for r in results if r.status == "decoded"),
         incomplete=sum(1 for r in results if r.status == "incomplete"),
         ambiguous=sum(1 for r in results if r.status == "ambiguous"),
         errors=sum(1 for r in results if r.status == "error"),
     )
-    return DecodeResponse(summary=summary, results=results)
+
+
+def _build_response(items: list[SentenceIn]) -> DecodeResponse:
+    results = process_batch(items)
+    return DecodeResponse(summary=summarize(results, len(items)), results=results)
 
 
 @app.get("/health", tags=["meta"])
@@ -132,6 +156,11 @@ def decode(request: DecodeRequest):
     return response
 
 
+def _kind_of(message: MessageData) -> str:
+    """Snapshot timeline (``position``/``static``) for a decoded message."""
+    return KIND_POSITION if message.message_type in (1, 2, 3) else KIND_STATIC
+
+
 def _apply_to_store(
     results: list[DecodeResult], observed_at: str, store: SnapshotStore
 ) -> list[VesselSnapshot]:
@@ -148,9 +177,9 @@ def _apply_to_store(
         if result.status != "decoded" or result.decoded is None:
             continue
         message = result.decoded
-        kind = KIND_POSITION if message.message_type in (1, 2, 3) else KIND_STATIC
         store.upsert_if_newer(
-            result.source_id, message.mmsi, kind, observed_at, message.model_dump()
+            result.source_id, message.mmsi, _kind_of(message), observed_at,
+            message.model_dump(),
         )
         involved.add((result.source_id, message.mmsi))
 
@@ -205,3 +234,225 @@ def ingest(request: IngestRequest):
 )
 def list_vessels(source_id: Optional[str] = None, mmsi: Optional[int] = None):
     return get_store().list_snapshots(source_id=source_id, mmsi=mmsi)
+
+
+# ---------------------------------------------------------------------------
+# Manual review of ambiguous batches
+# ---------------------------------------------------------------------------
+
+def _review_from_row(row: sqlite3.Row) -> ReviewBatch:
+    """Rebuild the API view of a stored review batch."""
+    sentences = [SentenceIn(**item) for item in json.loads(row["request"])]
+    results = [DecodeResult(**item) for item in json.loads(row["results"])]
+    resolution = json.loads(row["resolution"]) if row["resolution"] else None
+    return ReviewBatch(
+        batch_id=row["batch_id"],
+        status=row["status"],
+        observed_at=_parse_observed_at(row["observed_at"]),
+        created_at=_parse_observed_at(row["created_at"]),
+        resolved_at=(
+            _parse_observed_at(row["resolved_at"]) if row["resolved_at"] else None
+        ),
+        total_sentences=len(sentences),
+        ambiguous_pools=sum(1 for r in results if r.status == "ambiguous"),
+        sentences=sentences,
+        summary=summarize(results, len(sentences)),
+        results=results,
+        selections=resolution["selections"] if resolution else None,
+        snapshots=(
+            [VesselSnapshot(**item) for item in resolution["snapshots"]]
+            if resolution
+            else None
+        ),
+    )
+
+
+@app.post(
+    "/reviews",
+    status_code=201,
+    response_model=ReviewBatch,
+    responses={
+        201: {"description": "Ambiguous batch stored as a pending review batch."},
+        422: {
+            "description": (
+                "Request body invalid, or the batch contains no ambiguous "
+                "fragment pool (nothing to review)."
+            ),
+        },
+    },
+    tags=["review"],
+)
+def create_review(request: ReviewCreateRequest):
+    """Store an ambiguous batch for later manual resolution.
+
+    The sentences are validated, assembled and decoded exactly like
+    ``POST /ingest``; the original batch and every candidate of every
+    ambiguous pool are persisted, but **no vessel snapshot is touched**
+    until the batch is resolved.
+    """
+    results = process_batch(request.sentences)
+    if not any(r.status == "ambiguous" for r in results):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "batch contains no ambiguous fragment pool; only ambiguous "
+                "batches are accepted for review"
+            ),
+        )
+    store = get_store()
+    batch_id = uuid.uuid4().hex
+    store.create_review(
+        batch_id=batch_id,
+        observed_at=normalize_observed_at(request.observed_at),
+        created_at=normalize_observed_at(datetime.now(timezone.utc)),
+        request_json=json.dumps(jsonable_encoder(request.sentences)),
+        results_json=json.dumps(jsonable_encoder(results)),
+    )
+    row = store.get_review(batch_id)
+    assert row is not None  # just inserted
+    return _review_from_row(row)
+
+
+@app.get(
+    "/reviews",
+    response_model=list[ReviewBatchSummary],
+    tags=["review"],
+    description=(
+        "List review batches, optionally filtered by status "
+        "('pending' or 'resolved')."
+    ),
+)
+def list_reviews(status: Optional[ReviewStatus] = None):
+    return [_review_from_row(row) for row in get_store().list_reviews(status)]
+
+
+@app.get(
+    "/reviews/{batch_id}",
+    response_model=ReviewBatch,
+    responses={404: {"description": "Unknown batch id."}},
+    tags=["review"],
+    description=(
+        "Full detail of one review batch: original sentences, decode "
+        "results with every listed candidate per ambiguous pool and, once "
+        "resolved, the chosen candidates and the stored snapshots."
+    ),
+)
+def get_review(batch_id: str):
+    row = get_store().get_review(batch_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"unknown review batch '{batch_id}'")
+    return _review_from_row(row)
+
+
+@app.post(
+    "/reviews/{batch_id}/resolve",
+    response_model=ReviewBatch,
+    responses={
+        200: {
+            "description": (
+                "Batch resolved: the selected candidates and the batch's "
+                "unambiguous decodes were applied to the snapshots."
+            ),
+        },
+        404: {"description": "Unknown batch id."},
+        409: {"description": "Batch was already resolved."},
+        422: {
+            "description": (
+                "A selection is missing, does not match a listed candidate, "
+                "or refers to a candidate that failed to decode; the whole "
+                "resolution is rejected and nothing is written."
+            ),
+        },
+    },
+    tags=["review"],
+)
+def resolve_review(batch_id: str, request: ReviewResolveRequest):
+    """Apply a human resolution: one listed, successfully decoded candidate
+    per ambiguous pool, plus the batch's unambiguous decodes.
+
+    Every message is written under the batch ``observed_at`` in original
+    sentence-index order (first index wins for one vessel and class). The
+    status flip and the snapshot writes commit atomically; a newer snapshot
+    already stored is never rolled back, but the batch is still marked
+    resolved and the response carries the snapshots actually stored.
+    """
+    store = get_store()
+    row = store.get_review(batch_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"unknown review batch '{batch_id}'")
+    if row["status"] != "pending":
+        raise HTTPException(
+            status_code=409, detail=f"review batch '{batch_id}' is already resolved"
+        )
+    review = _review_from_row(row)
+
+    pools = [r for r in review.results if r.status == "ambiguous"]
+    # a candidate is uniquely identified by its sentence indexes
+    listed: dict[tuple[int, ...], tuple[int, DecodeResult, Candidate]] = {}
+    for pool_index, pool in enumerate(pools):
+        for candidate in pool.candidates or []:
+            listed[tuple(candidate.sentence_indexes)] = (pool_index, pool, candidate)
+
+    if len(request.selections) != len(pools):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "exactly one selection per ambiguous pool is required: the "
+                f"batch has {len(pools)} pool(s), got "
+                f"{len(request.selections)} selection(s)"
+            ),
+        )
+
+    chosen: list[tuple[int, str, MessageData]] = []
+    covered: set[int] = set()
+    for selection in request.selections:
+        key = tuple(selection)
+        if key not in listed:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"selection {selection} does not match any candidate "
+                    "listed for this batch"
+                ),
+            )
+        pool_index, pool, candidate = listed[key]
+        covered.add(pool_index)
+        if candidate.error is not None or candidate.decoded is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"selected candidate {selection} failed to decode and "
+                    "cannot be applied"
+                ),
+            )
+        chosen.append((candidate.sentence_indexes[0], pool.source_id, candidate.decoded))
+    if len(covered) != len(pools):
+        raise HTTPException(
+            status_code=422,
+            detail="every ambiguous pool needs exactly one selected candidate",
+        )
+
+    # The batch's unambiguous decodes join the write set; everything is
+    # applied in original sentence-index order under the batch observed_at.
+    indexed: list[tuple[int, str, MessageData]] = [
+        (r.sentence_indexes[0], r.source_id, r.decoded)
+        for r in review.results
+        if r.status == "decoded" and r.decoded is not None
+    ]
+    indexed.extend(chosen)
+    indexed.sort(key=lambda item: item[0])
+    observed_at = normalize_observed_at(review.observed_at)
+    writes = [
+        (source_id, message.mmsi, _kind_of(message), observed_at, message.model_dump())
+        for _index, source_id, message in indexed
+    ]
+
+    resolved_at = normalize_observed_at(datetime.now(timezone.utc))
+    snapshots = store.resolve_review(batch_id, resolved_at, request.selections, writes)
+    if snapshots is None:  # lost a race against a concurrent resolution
+        raise HTTPException(
+            status_code=409, detail=f"review batch '{batch_id}' is already resolved"
+        )
+    row = store.get_review(batch_id)
+    assert row is not None  # just resolved
+    return _review_from_row(row)

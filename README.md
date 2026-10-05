@@ -5,6 +5,9 @@
 完成校验、乱序分片重组、歧义枚举与六位 payload 解码。
 `POST /ingest` 在此基础上携带本批 UTC 观测时间 `observed_at`，把成功解码的消息
 按 `(source_id, MMSI)` 持久化为可查询的船舶快照（SQLite），并提供 `GET /vessels` 查询。
+对无 `sequence_id` 的歧义批，`POST /reviews` 可建立**待核定批**（保存原批与各歧义池全部候选，
+不写快照），由人工核定后经 `POST /reviews/{batch_id}/resolve` 把选定候选连同本批明确解码结果
+原子写入快照；`GET /reviews` / `GET /reviews/{batch_id}` 随时查询待核定批、候选与核定结果。
 
 ## 功能
 
@@ -32,6 +35,14 @@
   - 整条消息原样保存：新船位坐标为 `null` 时保留 `null`，**不借用历史坐标**；
   - 错误、缺片与歧义候选**不写入**快照；歧义批仍返回 409，但其中明确解码的消息**仍更新**快照；
   - 本地 **SQLite** 持久化，Compose 重启后仍可查询。
+- **歧义批人工核定（`/reviews`）**：
+  - `POST /reviews` 提交原语句与 `observed_at` 建立**待核定批**：复用同一套校验/重组/解码，
+    持久保存原批与各歧义池的全部候选并返回批次 ID；**仅接受存在歧义的批次**，**建批时不写快照**；
+  - `POST /reviews/{batch_id}/resolve` 为每个歧义池选定一个**已列出且成功解码**的候选，
+    连同本批明确解码结果**按原语句下标**写入快照；缺选、伪造或解码失败的候选**整批拒绝**，
+    不留部分写入；**核定状态与快照写入同事务**，已核定批不可改选或重复写入；
+  - 核定前已有更晚观测写入时**较新快照不回滚**，批次仍记为已核定并返回**实际保存的快照**；
+  - `GET /reviews` / `GET /reviews/{batch_id}` 查询待核定批、候选与核定结果，**重启后仍可查询**。
 - 交互式 API 文档：`/docs`（Swagger UI）、`/redoc`。
 
 ## 快速开始
@@ -61,7 +72,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 57 个单元/集成测试
+pytest -q          # 71 个单元/集成测试
 ```
 
 ## API
@@ -157,6 +168,111 @@ GET /vessels?source_id=ais-receiver-1&mmsi=366999999
 
 `position`（消息 1/2/3）与 `static`（消息 5）是两条独立时间线，各自携带写入时的
 批次 `observed_at`；对应消息类尚未解码到时该侧为 `null`。
+
+### `POST /reviews`（建立待核定批）
+
+请求体与 `/ingest` 相同（`observed_at` + `sentences`）。服务复用同一套校验、去重、
+重组与解码，把**原批**和**各歧义池的全部候选**持久化并返回批次 ID；**建批时不写任何
+船舶快照**。仅接受存在歧义的批次：
+
+| 状态码 | 含义 |
+| ------ | ---- |
+| `201`  | 待核定批已建立，响应含 `batch_id`、`results`（含各池 `candidates`） |
+| `422`  | 请求体不合法，或批中**不存在歧义分组**（无需核定） |
+
+```bash
+curl -s -X POST http://localhost:8000/reviews \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "observed_at": "2026-10-05T09:30:00Z",
+    "sentences": [
+      {"source_id": "ais-receiver-2",
+       "sentence": "!AIVDM,2,1,,B,55M2oP@2:N0l4447774pu9@PE8r1=@5800000016<PD886P`,0*40"},
+      {"source_id": "ais-receiver-2",
+       "sentence": "!AIVDM,2,1,,B,55M2oPP2:N0p888;;;9<uE@PE8r0=8u=<000001@;@I796i9,0*43"},
+      {"source_id": "ais-receiver-2",
+       "sentence": "!AIVDM,2,2,,B,0B0Slm3kP00000000000000,2*3F"}
+    ]
+  }'
+```
+
+响应 `201`（节选）——`batch_id` 用于后续查询与核定：
+
+```json
+{
+  "batch_id": "e9b441effb2d442f8dff0052f9ff3eee",
+  "status": "pending",
+  "observed_at": "2026-10-05T09:30:00Z",
+  "resolved_at": null,
+  "ambiguous_pools": 1,
+  "results": [
+    {
+      "status": "ambiguous",
+      "candidates": [
+        { "sentence_indexes": [0, 2], "decoded": { "mmsi": 366000001, "name": "NORTHERN STAR", "...": "..." } },
+        { "sentence_indexes": [1, 2], "decoded": { "mmsi": 366000002, "name": "SOUTHERN CROSS", "...": "..." } }
+      ]
+    }
+  ]
+}
+```
+
+### `GET /reviews` / `GET /reviews/{batch_id}`（查询）
+
+```bash
+curl -s 'http://localhost:8000/reviews'                      # 全部批次（摘要）
+curl -s 'http://localhost:8000/reviews?status=pending'       # 仅待核定（或 resolved）
+curl -s 'http://localhost:8000/reviews/e9b441effb2d442f8dff0052f9ff3eee'   # 单批详情
+```
+
+- 列表视图返回摘要（`batch_id`、`status`、`observed_at`、`created_at`、`resolved_at`、
+  `total_sentences`、`ambiguous_pools`）；详情视图另含原批 `sentences`、完整 `results`
+  （含各歧义池候选）；已核定批还含 `selections` 与核定实际写入的 `snapshots`；
+- 未知批次 ID 返回 `404`；批次与候选存于 SQLite，**重启后仍可查询**。
+
+### `POST /reviews/{batch_id}/resolve`（核定）
+
+为**每个歧义池**选定一个候选：`selections` 的每一项是所选候选在 `results[].candidates`
+中列出的 `sentence_indexes`（原样照抄）。核定时把选定候选与本批**明确解码**的结果一起，
+按**原语句下标**顺序、以建批时的 `observed_at` 写入快照（同船同类同观测时间仍按下标取首条；
+错误与缺片结果不入库）。
+
+```bash
+curl -s -X POST http://localhost:8000/reviews/e9b441effb2d442f8dff0052f9ff3eee/resolve \
+  -H 'Content-Type: application/json' \
+  -d '{"selections": [[0, 2]]}'
+```
+
+响应 `200`（节选）——批次记为已核定，`snapshots` 为**实际保存**的快照：
+
+```json
+{
+  "batch_id": "e9b441effb2d442f8dff0052f9ff3eee",
+  "status": "resolved",
+  "resolved_at": "2026-10-05T10:05:00Z",
+  "selections": [[0, 2]],
+  "snapshots": [
+    {
+      "source_id": "ais-receiver-2",
+      "mmsi": 366000001,
+      "static": {
+        "observed_at": "2026-10-05T09:30:00Z",
+        "data": { "message_type": 5, "name": "NORTHERN STAR", "destination": "BOSTON", "...": "..." }
+      }
+    }
+  ]
+}
+```
+
+| 状态码 | 含义 |
+| ------ | ---- |
+| `200`  | 核定完成；快照写入与状态翻转**原子提交**，响应含实际保存的快照 |
+| `404`  | 未知批次 ID |
+| `409`  | 批次**已核定**（不可改选或重复写入） |
+| `422`  | 缺选（数量与歧义池不符）、候选未列出（伪造）或所选候选解码失败——**整批拒绝，不留部分写入** |
+
+核定前若已有更晚 `observed_at` 的观测写入同一 `(source_id, MMSI, 消息类)`，较新快照
+**不回滚**；批次仍记为已核定，响应与后续 `GET /reviews/{batch_id}` 返回实际保存的快照。
 
 ### 哨兵值 → `null`
 
@@ -406,20 +522,24 @@ curl -s 'http://localhost:8000/vessels?source_id=ais-receiver-1&mmsi=366999999'
   upsert——严格更新才覆盖，天然实现“旧批不回滚、同时间先保存者优先”；`/ingest` 按
   语句下标顺序应用本批解码结果，因此同批同类首条生效。快照保存整条解码消息，
   不做字段级合并（null 坐标原样保留）。
+- **人工核定**：待核定批的原语句、解码结果（含各歧义池全部候选）与核定结果
+  （`selections` + 实际写入的快照）以 JSON 持久化在同一 SQLite 库中，重启后仍可查询；
+  核定时“应用全部快照写入 + 翻转批次状态”在**单个事务**内完成——任一失败整体回滚，
+  批次保持待核定；状态翻转带 `status='pending'` 条件，并发/重复核定只会成功一次。
 
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 入口，POST /decode、POST /ingest、GET /vessels、GET /health
-  models.py      # Pydantic 请求/响应模型（含快照模型）
+  main.py        # FastAPI 入口，POST /decode、/ingest、/reviews、GET /vessels、/reviews、/health
+  models.py      # Pydantic 请求/响应模型（含快照与核定批模型）
   nmea.py        # NMEA 0183 语句解析与校验（XOR 校验和、分片、fill bits）
   ais.py         # 六位 armour、位提取、消息 1/2/3 与 5 解码
   assembler.py   # 归组、乱序重组、孤儿分片池歧义枚举
-  storage.py     # SQLite 快照存储（按 source_id+MMSI+消息类的最新值 upsert）
+  storage.py     # SQLite 快照存储与核定批持久化（含核定事务）
 scripts/
   generate_examples.py  # 重新生成 README/测试中的示例报文
-tests/           # pytest 单元与 API 集成测试（含快照时序语义）
+tests/           # pytest 单元与 API 集成测试（含快照时序语义与人工核定流程）
 Dockerfile
 docker-compose.yml      # 命名卷 ais-data 持久化 /data/ais.db
 requirements.txt / requirements-dev.txt

@@ -1,8 +1,8 @@
-"""SQLite persistence for per-vessel AIS snapshots.
+"""SQLite persistence for per-vessel AIS snapshots and review batches.
 
-One row per ``(source_id, mmsi, kind)`` where ``kind`` is ``'position'``
-(message types 1/2/3) or ``'static'`` (message type 5). A stored row is
-only replaced by a *strictly newer* ``observed_at``:
+``vessel_state``: one row per ``(source_id, mmsi, kind)`` where ``kind`` is
+``'position'`` (message types 1/2/3) or ``'static'`` (message type 5). A
+stored row is only replaced by a *strictly newer* ``observed_at``:
 
 * older batches never roll back newer state;
 * an equal ``observed_at`` keeps the row that was saved first;
@@ -13,6 +13,13 @@ only replaced by a *strictly newer* ``observed_at``:
 Whole decoded messages are stored as-is — a position report whose
 coordinates are "not available" (null) is stored with null coordinates;
 no fields are borrowed from older messages.
+
+``review_batch``: one row per manual-review batch created from an ambiguous
+batch of sentences. The original sentences and the full decode outcome
+(including every candidate of every ambiguous pool) are stored as JSON, so
+pending batches, their candidates and the resolution (chosen candidates plus
+the snapshots actually stored) survive restarts. Resolution applies the
+snapshot writes and flips the status in a single transaction.
 """
 from __future__ import annotations
 
@@ -42,6 +49,26 @@ CREATE TABLE IF NOT EXISTS vessel_state (
     data        TEXT NOT NULL,
     PRIMARY KEY (source_id, mmsi, kind)
 );
+
+CREATE TABLE IF NOT EXISTS review_batch (
+    batch_id     TEXT PRIMARY KEY,
+    status       TEXT NOT NULL CHECK (status IN ('pending', 'resolved')),
+    observed_at  TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    resolved_at  TEXT,
+    request      TEXT NOT NULL,
+    results      TEXT NOT NULL,
+    resolution   TEXT
+);
+"""
+
+_UPSERT_SQL = """
+INSERT INTO vessel_state (source_id, mmsi, kind, observed_at, data)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT (source_id, mmsi, kind) DO UPDATE SET
+    observed_at = excluded.observed_at,
+    data = excluded.data
+WHERE excluded.observed_at > vessel_state.observed_at
 """
 
 
@@ -74,6 +101,21 @@ class SnapshotStore:
 
     # -- writes -------------------------------------------------------------
 
+    def _upsert_row(
+        self,
+        source_id: str,
+        mmsi: int,
+        kind: str,
+        observed_at: str,
+        data: dict,
+    ) -> bool:
+        """UPSERT one row; caller must hold the lock and the transaction."""
+        payload = json.dumps(data, separators=(",", ":"), sort_keys=True)
+        cursor = self._conn.execute(
+            _UPSERT_SQL, (source_id, mmsi, kind, observed_at, payload)
+        )
+        return cursor.rowcount > 0
+
     def upsert_if_newer(
         self,
         source_id: str,
@@ -87,28 +129,17 @@ class SnapshotStore:
         *observed_at* must be normalised with :func:`normalize_observed_at`.
         Returns True when the row was (re)written.
         """
-        payload = json.dumps(data, separators=(",", ":"), sort_keys=True)
         with self._lock, self._conn:
-            cursor = self._conn.execute(
-                """
-                INSERT INTO vessel_state (source_id, mmsi, kind, observed_at, data)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT (source_id, mmsi, kind) DO UPDATE SET
-                    observed_at = excluded.observed_at,
-                    data = excluded.data
-                WHERE excluded.observed_at > vessel_state.observed_at
-                """,
-                (source_id, mmsi, kind, observed_at, payload),
-            )
-            return cursor.rowcount > 0
+            return self._upsert_row(source_id, mmsi, kind, observed_at, data)
 
     # -- reads ----------------------------------------------------------------
 
-    def _rows(
+    def _fetch_rows(
         self,
         source_id: Optional[str] = None,
         mmsi: Optional[int] = None,
     ) -> list[sqlite3.Row]:
+        """SELECT matching ``vessel_state`` rows; caller must hold the lock."""
         sql = "SELECT source_id, mmsi, kind, observed_at, data FROM vessel_state"
         clauses: list[str] = []
         params: list = []
@@ -121,8 +152,15 @@ class SnapshotStore:
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY source_id, mmsi, kind"
+        return list(self._conn.execute(sql, params).fetchall())
+
+    def _rows(
+        self,
+        source_id: Optional[str] = None,
+        mmsi: Optional[int] = None,
+    ) -> list[sqlite3.Row]:
         with self._lock:
-            return list(self._conn.execute(sql, params).fetchall())
+            return self._fetch_rows(source_id, mmsi)
 
     @staticmethod
     def _to_snapshot(
@@ -160,3 +198,86 @@ class SnapshotStore:
             self._to_snapshot(src, mmsi, rows)
             for (src, mmsi), rows in sorted(grouped.items())
         ]
+
+    # -- review batches -------------------------------------------------------
+
+    def create_review(
+        self,
+        batch_id: str,
+        observed_at: str,
+        created_at: str,
+        request_json: str,
+        results_json: str,
+    ) -> None:
+        """Store a new pending review batch (snapshots are not touched)."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO review_batch
+                    (batch_id, status, observed_at, created_at, request, results)
+                VALUES (?, 'pending', ?, ?, ?, ?)
+                """,
+                (batch_id, observed_at, created_at, request_json, results_json),
+            )
+
+    def get_review(self, batch_id: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM review_batch WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+
+    def list_reviews(self, status: Optional[str] = None) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM review_batch"
+        params: list = []
+        if status is not None:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY created_at, batch_id"
+        with self._lock:
+            return list(self._conn.execute(sql, params).fetchall())
+
+    def resolve_review(
+        self,
+        batch_id: str,
+        resolved_at: str,
+        selections: list[list[int]],
+        writes: list[tuple[str, int, str, str, dict]],
+    ) -> Optional[list[VesselSnapshot]]:
+        """Apply snapshot *writes* and mark the batch resolved, atomically.
+
+        *writes* are ``(source_id, mmsi, kind, observed_at, data)`` tuples in
+        original-sentence-index order; each is applied with the usual
+        strictly-newer rule, so newer snapshots are never rolled back. The
+        status flip and every write commit or roll back together. Returns
+        the involved vessels' snapshots as actually stored, or ``None`` when
+        the batch is unknown or already resolved (nothing is written then).
+        """
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT status FROM review_batch WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+            if row is None or row["status"] != "pending":
+                return None
+            for source_id, mmsi, kind, observed_at, data in writes:
+                self._upsert_row(source_id, mmsi, kind, observed_at, data)
+            involved = sorted({(w[0], w[1]) for w in writes})
+            snapshots = [
+                self._to_snapshot(source_id, mmsi, self._fetch_rows(source_id, mmsi))
+                for source_id, mmsi in involved
+            ]
+            resolution = json.dumps(
+                {
+                    "selections": selections,
+                    "snapshots": [s.model_dump(mode="json") for s in snapshots],
+                },
+                separators=(",", ":"),
+            )
+            self._conn.execute(
+                """
+                UPDATE review_batch
+                SET status = 'resolved', resolved_at = ?, resolution = ?
+                WHERE batch_id = ?
+                """,
+                (resolved_at, resolution, batch_id),
+            )
+            return snapshots

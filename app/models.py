@@ -214,3 +214,68 @@ class IngestResponse(BaseModel):
             "with a successfully decoded message in the batch."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Manual review of ambiguous batches
+# ---------------------------------------------------------------------------
+
+class ReviewCreateRequest(IngestRequest):
+    """Sentences plus batch observation time, stored as a pending review batch.
+
+    Same payload as :class:`IngestRequest`; the batch is validated, assembled
+    and decoded exactly like ``POST /ingest``, but creating the review batch
+    never touches the vessel snapshots.
+    """
+
+
+ReviewStatus = Literal["pending", "resolved"]
+
+
+class ReviewResolveRequest(BaseModel):
+    """One listed candidate per ambiguous pool, chosen by a human reviewer.
+
+    Every entry is the ``sentence_indexes`` list of the chosen candidate,
+    copied verbatim from the batch's ``results[].candidates``.
+    """
+
+    selections: list[list[int]] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "One entry per ambiguous pool of the batch: the sentence_indexes "
+            "of the chosen candidate, exactly as listed in the batch results."
+        ),
+        examples=[[[0, 2]]],
+    )
+
+
+class ReviewBatchSummary(BaseModel):
+    """Headline state of one review batch (list view)."""
+
+    batch_id: str
+    status: ReviewStatus
+    observed_at: datetime = Field(
+        ..., description="UTC observation time of the reviewed batch.")
+    created_at: datetime = Field(
+        ..., description="UTC time the review batch was created.")
+    resolved_at: Optional[datetime] = Field(
+        None, description="UTC time of resolution; null while pending.")
+    total_sentences: int
+    ambiguous_pools: int
+
+
+class ReviewBatch(ReviewBatchSummary):
+    """Full detail of one review batch.
+
+    ``sentences``/``results`` are the original batch and its decoded outcome
+    (each ambiguous pool lists every candidate under ``candidates``). Once
+    resolved, ``selections`` records the chosen candidates and ``snapshots``
+    the vessel snapshots actually stored by the resolution.
+    """
+
+    sentences: list[SentenceIn]
+    summary: Summary
+    results: list[DecodeResult]
+    selections: Optional[list[list[int]]] = None
+    snapshots: Optional[list[VesselSnapshot]] = None

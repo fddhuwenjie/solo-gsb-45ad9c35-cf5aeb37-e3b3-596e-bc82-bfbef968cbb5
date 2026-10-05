@@ -214,3 +214,92 @@ class IngestResponse(BaseModel):
             "with a successfully decoded message in the batch."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Manual review of ambiguous batches
+# ---------------------------------------------------------------------------
+
+class ReviewCreateRequest(IngestRequest):
+    """Sentences plus batch ``observed_at`` for a pending review batch.
+
+    Same shape as :class:`IngestRequest`, but the batch is only accepted
+    when at least one ambiguous fragment pool exists, and nothing is
+    written to the vessel snapshots at creation time.
+    """
+
+
+class ReviewPoolCandidate(Candidate):
+    """A listed candidate of an ambiguous pool, addressable for selection."""
+
+    candidate_id: int = Field(
+        ..., description="Identifier of this candidate within its pool (0-based).")
+
+
+class ReviewPool(BaseModel):
+    """One ambiguous fragment pool of a review batch, with its candidates."""
+
+    pool_id: int = Field(
+        ..., description="Identifier of this pool within the batch (0-based, "
+                         "ordered by first sentence index).")
+    source_id: str
+    sentence_indexes: list[int]
+    channel: Optional[str] = None
+    total_fragments: Optional[int] = None
+    detail: Optional[str] = None
+    candidates: list[ReviewPoolCandidate]
+
+
+class ReviewSelection(BaseModel):
+    """The adjudicator's choice of one listed candidate for one pool."""
+
+    pool_id: int = Field(..., ge=0)
+    candidate_id: int = Field(..., ge=0)
+
+
+class ReviewResolveRequest(BaseModel):
+    """One selection per ambiguous pool of the batch."""
+
+    selections: list[ReviewSelection] = Field(..., min_length=1)
+
+
+class ReviewResolution(BaseModel):
+    """Record of a completed adjudication (persisted with the batch)."""
+
+    selections: list[ReviewSelection]
+    resolved_at: datetime
+    snapshots: list[VesselSnapshot] = Field(
+        ...,
+        description=(
+            "Snapshots of every involved vessel as actually stored when the "
+            "resolution was applied (newer rows from other batches win, so "
+            "these may differ from the resolved messages)."
+        ),
+    )
+
+
+class ReviewBatch(BaseModel):
+    """A persisted review batch: original sentences, decode outcome, pools."""
+
+    batch_id: int
+    status: Literal["pending", "resolved"]
+    observed_at: datetime
+    created_at: datetime
+    resolved_at: Optional[datetime] = None
+    sentences: list[SentenceIn]
+    summary: Summary
+    results: list[DecodeResult]
+    pools: list[ReviewPool]
+    resolution: Optional[ReviewResolution] = None
+
+
+class ReviewBatchSummary(BaseModel):
+    """List view of a review batch (without sentences/candidates)."""
+
+    batch_id: int
+    status: Literal["pending", "resolved"]
+    observed_at: datetime
+    created_at: datetime
+    resolved_at: Optional[datetime] = None
+    total_sentences: int
+    ambiguous_pools: int
